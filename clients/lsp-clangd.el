@@ -178,6 +178,49 @@ This must be set only once after loading the clang client.")
   :risky t
   :type '(repeat string))
 
+(defun lsp-clangd-find-compile-commands-dir ()
+  "Return the full directory path (or nil) that contain a compile_commands.json.
+
+If multiple compile_commands.json files are
+found in the project directory tree - ask the user to choose."
+  ;; TODO lsp-workspace-root won't find anything at the start of the workspace
+  (let ((candidate-dirs (directory-files-recursively (lsp-workspace-root) "\\`compile_commands.json\\'")))
+    (pcase candidate-dirs
+          ;; TODO can I lsp--warn-user-in-message-and-log at the same time
+      (`nil (lsp--warn "Starting without compile_commands.json - clangd might not be able to handle complex projects")
+          nil)
+      ;; if you find 1 only - assume it's correct and strip the dirname from the full path
+      ;; happy path
+      (`(,unique-compile-commands-dir) (file-name-directory unique-compile-commands-dir))
+      ;; if you have several - ask the user to choose
+      ;; TODO if Ctrl-G from inside this completing read still falls to default lsp-clients-clangd-args
+      (multiple-dirs (file-name-directory (completing-read
+           "Found compile_commands.json in several directories, which one do you want to use?
+Consider setting lsp-clients-clangd-args to avoid this lookup in the future"
+           multiple-dirs))))))
+
+
+(defun lsp-clangd-update-args-with-compile-commands ()
+  "Return the default or updated clangd-args for the start command.
+If --compile-commands-dir is already set - return it.
+Else run a potentially interactive search for the directory
+that contains compile_commands.json.
+
+Then return either the default args or the modified args"
+  (if
+       ;; lsp-client-clangd-args might already lists a
+       ;; "--compile-commands-dir=build/" and will fail if we pass another one
+       ;; trust the user - if it's already set, don't mess around
+      (cl-find "--compile-commands-dir" lsp-clients-clangd-args)
+      (progn
+        (lsp--info "compilation_commands_dir set in clangd-args")
+        lsp-clients-clangd-args)
+    (if-let (found-dir (lsp-clangd-find-compile-commands-dir))
+        ;; TODO expensive to create a list from 1 element - how to append atom to list
+        (append lsp-clients-clangd-args (list (concat "--compile-commands-dir=" found-dir)))
+      lsp-clients-clangd-args)))
+
+
 (defun lsp-clients--clangd-command ()
   "Generate the language server startup command."
   (unless lsp-clients--clangd-default-executable
@@ -190,7 +233,7 @@ This must be set only once after loading the clang client.")
               (lsp-clients-executable-find "xcrun" "--find" "clangd"))))
 
   `(,(or lsp-clients-clangd-executable lsp-clients--clangd-default-executable "clangd")
-    ,@lsp-clients-clangd-args))
+    ,@(lsp-clangd-update-args-with-compile-commands)))
 
 (lsp-register-client
  (make-lsp-client :new-connection (lsp-stdio-connection
