@@ -3367,7 +3367,8 @@ disappearing, unset all the variables related to it."
                                                        (apply 'vector (mapcar #'car lsp-semantic-token-modifier-faces)) []))
                                 (tokenTypes . ,(apply 'vector (mapcar #'car lsp-semantic-token-faces)))
                                 (formats . ["relative"])))))
-                      (rename . ((dynamicRegistration . t) (prepareSupport . t)))
+                      (rename . ((dynamicRegistration . t) (prepareSupport . t)
+                                 (prepareSupportDefaultBehavior . t)))
                       (codeAction . ((dynamicRegistration . t)
                                      (isPreferredSupport . t)
                                      (codeActionLiteralSupport . ((codeActionKind . ((valueSet . [""
@@ -5786,6 +5787,13 @@ the symbol to rename at point."
   :group 'lsp-mode
   :type 'boolean)
 
+(defun lsp--get-symbol-to-rename-default ()
+  "`lsp--get-symbol-to-rename', but using `symbol-at-point'.
+This returns rename bounds for cases where the server's result
+cannot be used."
+  (when-let ((bounds (bounds-of-thing-at-point 'symbol)))
+    (cons bounds nil)))
+
 (defun lsp--get-symbol-to-rename ()
   "Get a symbol to rename and placeholder at point.
 Returns a cons ((START . END) . PLACEHOLDER?), and nil if
@@ -5796,19 +5804,20 @@ language server as the initial input of a new-name prompt."
   (unless (lsp-feature? "textDocument/rename")
     (error "The connected server(s) doesn't support renaming"))
   (if (and lsp-rename-use-prepare (lsp-feature? "textDocument/prepareRename"))
-      (when-let ((response
-                  (lsp-request "textDocument/prepareRename"
-                               (lsp--text-document-position-params))))
-        (let* ((bounds (lsp--range-to-region
-                        (if (lsp-range? response)
-                            response
-                          (lsp:prepare-rename-result-range response))))
-               (placeholder
-                (and (not (lsp-range? response))
-                     (lsp:prepare-rename-result-placeholder response))))
-          (cons bounds placeholder)))
-    (when-let ((bounds (bounds-of-thing-at-point 'symbol)))
-      (cons bounds nil))))
+      (when-let ((response (lsp-request "textDocument/prepareRename"
+                                        (lsp--text-document-position-params))))
+        (if (lsp:prepare-rename-default-behavior-result-default-behavior
+             response)
+            (lsp--get-symbol-to-rename-default)
+          (let* ((bounds (lsp--range-to-region
+                          (if (lsp-range? response)
+                              response
+                            (lsp:prepare-rename-result-range response))))
+                 (placeholder
+                  (and (not (lsp-range? response))
+                       (lsp:prepare-rename-result-placeholder response))))
+            (cons bounds placeholder))))
+    (lsp--get-symbol-to-rename-default)))
 
 (defface lsp-face-rename '((t :underline t))
   "Face used to highlight the identifier being renamed.
