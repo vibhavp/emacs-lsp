@@ -6512,14 +6512,26 @@ Return a nested alist keyed by symbol names. e.g.
   (when menu-bar-mode
     (lsp--imenu-refresh)))
 
+(defun lsp--check-command-list (final-command)
+  "Assert that FINAL-COMMAND is correctly formatted.
+FINAL-COMMAND shall be a list of arguments to start a program,
+the first being the program itself.
+
+Currently throws an error if FINAL-COMMAND contains non-strings,
+but additional checks may be added in the future."
+  (cl-assert (seq-every-p (apply-partially #'stringp) final-command) nil
+             "Invalid command list"))
+
 (defun lsp-resolve-final-function (command)
   "Resolve final function COMMAND."
   (-let [command (if (functionp command) (funcall command) command)]
     (cl-etypecase command
       (list
-       (cl-assert (seq-every-p (apply-partially #'stringp) command) nil
-                  "Invalid command list")
+       (lsp--check-command-list command)
        command)
+      (vector
+       (lsp--check-command-list command)
+       (cl-coerce command 'list))
       (string (list command)))))
 
 (defun lsp-server-present? (final-command)
@@ -6639,83 +6651,109 @@ returned by COMMAND is available via `executable-find'"
         (file-error (setq success t))))
     port))
 
-(defun lsp-tcp-connection (command-fn)
-  "Returns a connection property list similar to `lsp-stdio-connection'.
-COMMAND-FN can only be a function that takes a single argument, a
-port number. It should return a command for launches a language server
-process listening for TCP connections on the provided port."
+(defun lsp-resolve-tcp-function (command-fn port)
+  "Get a command from COMMAND-FN.
+COMMAND-FN shall be a function that takes a single integer
+argument, PORT, and yields a command (see
+`lsp-resolve-final-function')."
+  (lsp-resolve-final-function (funcall command-fn port)))
+
+(defun lsp--tcp-command-present (command-fn)
+  "Make a checker-function for COMMAND-FN.
+The result is a function that, if called, checks wether
+COMMAND-FN (as defined in `lsp-tcp-connection') yields a command
+that can be executed."
+  (lambda () (lsp-server-present? (lsp-resolve-tcp-function command-fn 0))))
+
+(defun lsp-tcp-connection (command-fn &optional test-fn)
+  "Return an lsp connection object for TCP servers.
+COMMAND-FN will be called to start the server and shall take a
+single argument, the port, which is an int. It should return a
+command to launch the server (see `lsp-resolve-final-function').
+
+TEST-FN is a function that should yield a truthy value if and
+only if the server can be started. If this is unspecified,
+COMMAND-FN will be called with PORT=0 and its output examined."
   (cl-check-type command-fn function)
   (list
-   :connect (lambda (filter sentinel name environment-fn)
-              (let* ((host "localhost")
-                     (port (lsp--find-available-port host (cl-incf lsp--tcp-port)))
-                     (command (funcall command-fn port))
-                     (final-command (if (consp command) command (list command)))
-                     (_ (unless (executable-find (cl-first final-command))
-                          (user-error (format "Couldn't find executable %s" (cl-first final-command)))))
-                     (process-environment
-                      (lsp--compute-process-environment environment-fn))
-                     (proc (make-process :name name :connection-type 'pipe :coding 'no-conversion
-                                         :command final-command :sentinel sentinel :stderr (format "*%s::stderr*" name) :noquery t))
-                     (tcp-proc (lsp--open-network-stream host port (concat name "::tcp"))))
+   :connect
+   (lambda (filter sentinel name environment-fn)
+     (let* ((host "localhost")
+            (port (lsp--find-available-port host (cl-incf lsp--tcp-port)))
+            (command (funcall command-fn port))
+            (final-command (lsp-resolve-tcp-function command port))
+            (process-environment
+             (lsp--compute-process-environment environment-fn))
+            (proc (make-process :name name
+                                :connection-type 'pipe :coding 'no-conversion
+                                :command final-command :sentinel sentinel
+                                :stderr (format "*%s::stderr*" name) :noquery t))
+            (tcp-proc
+             (lsp--open-network-stream host port (concat name "::tcp"))))
 
-                ;; TODO: Same :noquery issue (see above)
-                (set-process-query-on-exit-flag proc nil)
-                (set-process-query-on-exit-flag tcp-proc nil)
-                (set-process-filter tcp-proc filter)
-                (cons tcp-proc proc)))
-   :test? (lambda () (executable-find (cl-first (funcall command-fn 0))))))
+       ;; TODO: Same :noquery issue (see above)
+       (set-process-query-on-exit-flag proc nil)
+       (set-process-query-on-exit-flag tcp-proc nil)
+       (set-process-filter tcp-proc filter)
+       (cons tcp-proc proc)))
+   :test? (or test-fn (lsp--tcp-command-present command-fn))))
 
 (defalias 'lsp-tcp-server 'lsp-tcp-server-command)
 
-(defun lsp-tcp-server-command (command-fn)
+(defun lsp-tcp-server-command (command-fn &optional test-fn)
   "Create tcp server connection.
-In this mode Emacs is TCP server and the language server connects
-to it. COMMAND is function with one parameter(the port) and it
-should return the command to start the LS server."
+Like `lsp-tcp-connection', but in reverse: Emacs listens for a
+connection from the language server, not the other way around.
+
+COMMAND-FN and TEST-FN behave as there."
   (cl-check-type command-fn function)
   (list
-   :connect (lambda (filter sentinel name environment-fn)
-              (let* (tcp-client-connection
-                     (tcp-server (make-network-process :name (format "*tcp-server-%s*" name)
-                                                       :buffer (format "*tcp-server-%s*" name)
-                                                       :family 'ipv4
-                                                       :service lsp--tcp-server-port
-                                                       :sentinel (lambda (proc _string)
-                                                                   (lsp-log "Language server %s is connected." name)
-                                                                   (setf tcp-client-connection proc))
-                                                       :server 't))
-                     (port (process-contact tcp-server :service))
-                     (final-command (funcall command-fn port))
-                     (process-environment
-                      (lsp--compute-process-environment environment-fn))
-                     (cmd-proc (make-process :name name
-                                             :connection-type 'pipe
-                                             :coding 'no-conversion
-                                             :command final-command
-                                             :stderr (format "*tcp-server-%s*::stderr" name)
-                                             :noquery t)))
-                (let ((retries 0))
-                  ;; wait for the client to connect (we sit-for 500 ms, so have to double lsp--tcp-server-wait-seconds)
-                  (while (and (not tcp-client-connection) (< retries (* 2 lsp--tcp-server-wait-seconds)))
-                    (lsp--info "Waiting for connection for %s, retries: %s" name retries)
-                    (sit-for 0.500)
-                    (cl-incf retries)))
+   :connect
+   (lambda (filter sentinel name environment-fn)
+     (let* (tcp-client-connection
+            (tcp-server
+             (make-network-process
+              :name (format "*tcp-server-%s*" name)
+              :buffer (format "*tcp-server-%s*" name)
+              :family 'ipv4
+              :service lsp--tcp-server-port
+              :sentinel (lambda (proc _string)
+                          (lsp-log "Language server %s is connected." name)
+                          (setf tcp-client-connection proc))
+              :server 't))
+            (port (process-contact tcp-server :service))
+            (final-command (lsp-resolve-tcp-function command-fn port))
+            (process-environment
+             (lsp--compute-process-environment environment-fn))
+            (cmd-proc (make-process :name name
+                                    :connection-type 'pipe
+                                    :coding 'no-conversion
+                                    :command final-command
+                                    :stderr (format "*tcp-server-%s*::stderr" name)
+                                    :noquery t)))
+       (let ((retries 0))
+         ;; wait for the client to connect (we sit-for 500 ms, so have
+         ;; to double lsp--tcp-server-wait-seconds)
+         (while (and (not tcp-client-connection) (< retries (* 2 lsp--tcp-server-wait-seconds)))
+           (lsp--info "Waiting for connection for %s, retries: %s" name retries)
+           (sit-for 0.500)
+           (cl-incf retries)))
 
-                (unless tcp-client-connection
-                  (condition-case nil (delete-process tcp-server) (error))
-                  (condition-case nil (delete-process cmd-proc) (error))
-                  (error "Failed to create connection to %s on port %s" name port))
-                (lsp--info "Successfully connected to %s" name)
+       (unless tcp-client-connection
+         (condition-case nil (delete-process tcp-server) (error))
+         (condition-case nil (delete-process cmd-proc) (error))
+         (error "Failed to create connection to %s on port %s" name port))
+       (lsp--info "Successfully connected to %s" name)
 
-                (set-process-query-on-exit-flag cmd-proc nil)
-                (set-process-query-on-exit-flag tcp-client-connection nil)
-                (set-process-query-on-exit-flag tcp-server nil)
+       (set-process-query-on-exit-flag cmd-proc nil)
+       (set-process-query-on-exit-flag tcp-client-connection nil)
+       (set-process-query-on-exit-flag tcp-server nil)
 
-                (set-process-filter tcp-client-connection filter)
-                (set-process-sentinel tcp-client-connection sentinel)
-                (cons tcp-client-connection cmd-proc)))
-   :test? (lambda () (executable-find (cl-first (funcall command-fn 0))))))
+       (set-process-filter tcp-client-connection filter)
+       (set-process-sentinel tcp-client-connection sentinel)
+       (cons tcp-client-connection cmd-proc)))
+   :test?
+   (or test-fn (lsp--tcp-command-present command-fn))))
 
 (defun lsp-tramp-connection (local-command &optional generate-error-file-fn)
   "Create LSP stdio connection named name.
