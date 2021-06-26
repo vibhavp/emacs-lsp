@@ -57,6 +57,7 @@
 (require 'minibuffer)
 (require 'yasnippet nil t)
 (require 'lsp-protocol)
+(require 'lsp-emacsng)
 
 (defgroup lsp-mode nil
   "Language Server Protocol client."
