@@ -6732,31 +6732,33 @@ returned by COMMAND is available via `executable-find'"
                                                (seq-every-p (lambda (el)
                                                               (stringp el))
                                                             l))))))
-  (list :connect (lambda (filter sentinel name environment-fn)
-                   (let ((final-command (lsp-resolve-final-function command))
-                         (process-name (generate-new-buffer-name name))
-                         (process-environment
-                          (lsp--compute-process-environment environment-fn)))
-                     (let* ((stderr-buf (format "*%s::stderr*" process-name))
-                            (proc (make-process
-                                   :name process-name
-                                   :connection-type 'pipe
-                                   :buffer (format "*%s*" process-name)
-                                   :coding 'no-conversion
-                                   :command final-command
-                                   :filter filter
-                                   :sentinel sentinel
-                                   :stderr stderr-buf
-                                   :noquery t)))
-                       (set-process-query-on-exit-flag proc nil)
-                       (set-process-query-on-exit-flag (get-buffer-process stderr-buf) nil)
-                       (with-current-buffer (get-buffer stderr-buf)
-                         ;; Make the *NAME::stderr* buffer buffer-read-only, q to bury, etc.
-                         (special-mode))
-                       (cons proc proc))))
-        :test? (or
-                test-command
-                (lambda () (-> command lsp-resolve-final-function lsp-server-present?)))))
+  (if (featurep 'emacs-ng)
+      (lsp-emacsng-stdio-connection command test-command)
+    (list :connect (lambda (filter sentinel name environment-fn)
+                     (let ((final-command (lsp-resolve-final-function command))
+                           (process-name (generate-new-buffer-name name))
+                           (process-environment
+                            (lsp--compute-process-environment environment-fn)))
+                       (let* ((stderr-buf (format "*%s::stderr*" process-name))
+                              (proc (make-process
+                                     :name process-name
+                                     :connection-type 'pipe
+                                     :buffer (format "*%s*" process-name)
+                                     :coding 'no-conversion
+                                     :command final-command
+                                     :filter filter
+                                     :sentinel sentinel
+                                     :stderr stderr-buf
+                                     :noquery t)))
+                         (set-process-query-on-exit-flag proc nil)
+                         (set-process-query-on-exit-flag (get-buffer-process stderr-buf) nil)
+                         (with-current-buffer (get-buffer stderr-buf)
+                           ;; Make the *NAME::stderr* buffer buffer-read-only, q to bury, etc.
+                           (special-mode))
+                         (cons proc proc))))
+          :test? (or
+                  test-command
+                  (lambda () (-> command lsp-resolve-final-function lsp-server-present?))))))
 
 (defun lsp--open-network-stream (host port name)
   "Open network stream to HOST:PORT.
