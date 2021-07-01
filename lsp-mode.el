@@ -5960,7 +5960,9 @@ textDocument/didOpen for the new file."
       (lsp--flush-delayed-changes)))
 
   (condition-case err
-      (process-send-string proc message)
+      (if (featurep 'emacs-ng)
+          (lsp-emacsng-send-no-wait message)
+        (process-send-string proc message))
     ('error (lsp--error "Sending to process failed with the following error: %s"
                         (error-message-string err)))))
 
