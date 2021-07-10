@@ -1293,9 +1293,15 @@ the lists according to METHOD."
 
 TRANSFORM-FN will be used to transform each of the items before displaying.
 
-PROMPT COLLECTION PREDICATE REQUIRE-MATCH INITIAL-INPUT HIST DEF
-INHERIT-INPUT-METHOD will be proxied to `completing-read' without changes."
+IF DEF is a number, it specifies the zero-based index into the
+COLLECTION that is to be used as the default result and that is
+to be preselected.
+
+PROMPT COLLECTION PREDICATE REQUIRE-MATCH INITIAL-INPUT HIST
+INHERIT-INPUT-METHOD will be proxied to `completing-read' without
+changes."
   (let* ((col (--map (cons (funcall transform-fn it) it) collection))
+         (def (if (numberp def) (nth def col) def))
          (completion (completing-read prompt col
                                       predicate require-match initial-input hist
                                       def inherit-input-method)))
@@ -3368,6 +3374,7 @@ disappearing, unset all the variables related to it."
                       (rename . ((dynamicRegistration . t) (prepareSupport . t)))
                       (codeAction . ((dynamicRegistration . t)
                                      (isPreferredSupport . t)
+                                     (disabledSupport . t)
                                      (codeActionLiteralSupport . ((codeActionKind . ((valueSet . [""
                                                                                                   "quickfix"
                                                                                                   "refactor"
@@ -5013,18 +5020,46 @@ When language is nil render as markup if `markdown-mode' is loaded."
                  (format "%s (%s)" element count))
           (push element elements))))))
 
+(defface lsp-preferred-code-action-face '((t :underline t))
+  "Face used to highlight preferred code actions.
+Used by `lsp-execute-code-action' and
+`lsp-execute-code-action-by-kind' if they have to prompt for an
+action.")
+
+(defface lsp-disabled-code-action-face '((t :inherit shadow))
+  "Face used to highlight disabled code actions.
+See `lsp-preferred-code-action-face' for details.")
+
+(defface lsp-disabled-code-action-reason-face '((t :inherit lsp-details-face))
+  "Face used to highlight the reason a code action is disabled.
+Shown after the code action in `lsp-execute-code-action',
+... (see `lsp-preferred-code-action-face').")
+
+(lsp-defun lsp--code-action-title ((action &as &CodeAction :title :is-preferred? :disabled?))
+  "Render an `&CodeAction' as a propertized string."
+  (--doto (copy-sequence title)
+    (let ((len (length it)))
+      (when is-preferred?
+        (add-face-text-property 0 len 'lsp-preferred-code-action-face nil it))
+      (when disabled?
+        (add-face-text-property 0 len 'lsp-disabled-code-action-face nil it)
+        (-when-let ((&CodeActionDisabled :reason) disabled?)
+          (cl-callf concat it " " (propertize reason 'face 'lsp-disabled-code-action-reason-face)))))))
+
 (defun lsp--select-action (actions)
   "Select an action to execute from ACTIONS."
-  (cond
-   ((seq-empty-p actions) (signal 'lsp-no-code-actions nil))
-   ((and (eq (seq-length actions) 1) lsp-auto-execute-action)
-    (lsp-seq-first actions))
-   (t (let ((completion-ignore-case t))
-        (lsp--completing-read "Select code action: "
-                              (seq-into actions 'list)
-                              (-compose (lsp--create-unique-string-fn)
-                                        #'lsp:code-action-title)
-                              nil t)))))
+  (let ((actions (seq-into actions 'list)))
+    (pcase actions
+      (`nil (signal 'lsp-no-code-actions nil))
+      ((and `(,action) (guard lsp-auto-execute-action)) action)
+      (_ (let ((completion-ignore-case t))
+           (lsp--completing-read "Select code action: "
+                                 actions
+                                 (-compose (lsp--create-unique-string-fn)
+                                           #'lsp--code-action-title)
+                                 nil t nil nil
+                                 (or (-find-index #'lsp:code-action-is-preferred? actions)
+                                     (-find-index (-not #'lsp:code-action-disabled?) actions))))))))
 
 (defun lsp--workspace-server-id (workspace)
   "Return the server ID of WORKSPACE."
@@ -5399,19 +5434,57 @@ It will show up only if current point has signature help."
         :context `( :diagnostics ,(lsp-cur-line-diagnostics)
                     ,@(when kind (list :only (vector kind))))))
 
-(defun lsp-code-actions-at-point (&optional kind)
+(defun lsp-code-actions-at-point (&optional kind enabled)
   "Retrieve the code actions for the active region or the current line.
-It will filter by KIND if non nil."
-  (lsp-request "textDocument/codeAction" (lsp--text-document-code-action-params kind)))
+If ENABLED is specified, only return code actions that are not
+disabled."
+  (--doto (lsp-request "textDocument/codeAction" (lsp--text-document-code-action-params kind))
+    (when enabled
+      (cl-callf2 seq-remove #'lsp:code-action-disabled? it))))
 
 (defun lsp-execute-code-action-by-kind (command-kind)
-  "Execute code action by COMMAND-KIND."
-  (if-let ((action (->> (lsp-get-or-calculate-code-actions command-kind)
-                        (-filter (-lambda ((&CodeAction :kind?))
-                                   (and kind? (equal command-kind kind?))))
-                        lsp--select-action)))
-      (lsp-execute-code-action action)
-    (signal 'lsp-no-code-actions '(command-kind))))
+  "Execute code action by name."
+  (let* ((all-actions (->> (lsp-get-or-calculate-code-actions command-kind)
+                           (-filter (-lambda ((&CodeAction :kind?))
+                                      (and kind? (equal command-kind kind?))))))
+         (enabled-actions (-remove #'lsp:code-action-disabled? all-actions))
+         (action (lsp--select-action (or enabled-actions all-actions))))
+    (lsp-execute-code-action action)))
+
+(defun lsp-execute-code-action-by-type (kind &optional enabled)
+  "Execute a code action with a given base KIND.
+When ENABLED is given, filter out all disabled code actions. This
+is in contrast with the spec's recommended behavior."
+  (->> (lsp-get-or-calculate-code-actions kind enabled)
+       (-filter (-lambda ((&CodeAction :kind?))
+                  (and kind? (string-match-p (format "\\`%s\\(\\.\\|\\'\\)"
+                                                     (regexp-quote kind))
+                                             kind?))))
+       lsp--select-action
+       lsp-execute-code-action))
+
+(defmacro lsp-make-interactive-code-action-by-type (name kind)
+  "Make interactive function NAME to execute a KIND code action.
+Like `lsp-make-interactive-code-action' but using
+`lsp-execute-code-action-by-type'."
+  `(defun ,name ()
+     ,(format "Execute a %S code action at point." kind)
+     (interactive)
+     (condition-case nil
+         (lsp-execute-code-action-by-kind ,kind)
+       (lsp-no-code-actions
+        (user-error "No %S actions available")))))
+
+(lsp-make-interactive-code-action-by-type lsp-quickfix "quickfix")
+(lsp-make-interactive-code-action-by-type lsp-refactor "refactor")
+
+(defun lsp-auto-fix ()
+  "Execute a preferred code action at point."
+  (interactive)
+  (->> (lsp-get-or-calculate-code-actions)
+       (-filter #'lsp:code-action-is-preferred?)
+       lsp--select-action
+       lsp-execute-code-action))
 
 (defalias 'lsp-get-or-calculate-code-actions 'lsp-code-actions-at-point)
 
@@ -5430,11 +5503,19 @@ It will filter by KIND if non nil."
            (funcall action-handler action)
          (lsp-send-execute-command command arguments?))))))
 
-(lsp-defun lsp-execute-code-action ((action &as &CodeAction :command? :edit?))
+(lsp-defun lsp-execute-code-action ((action &as &CodeAction :command? :edit? :disabled?))
   "Execute code action ACTION.
-If ACTION is not set it will be selected from `lsp-code-actions-at-point'.
-Request codeAction/resolve for more info if server supports."
-  (interactive (list (lsp--select-action (lsp-code-actions-at-point))))
+Interactively, ask for a code action. With the prefix argument,
+filter those that are not disabled. Request codeAction/resolve
+for more info if server supports."
+  (interactive
+   (list (lsp--select-action
+          (lsp-code-actions-at-point nil (not current-prefix-arg)))))
+  (when disabled?
+    (error "%s is disabled%s"
+           (lsp:code-action-title action)
+           (or (-some->> (lsp:code-action-disabled-reason disabled?) (concat ": ")) "")))
+
   (if (and (lsp-feature? "codeAction/resolve")
            (not command?)
            (not edit?))
