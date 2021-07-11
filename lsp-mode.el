@@ -57,6 +57,7 @@
 (require 'minibuffer)
 (require 'yasnippet nil t)
 (require 'lsp-protocol)
+(require 'lsp-emacsng)
 
 (defgroup lsp-mode nil
   "Language Server Protocol client."
@@ -2904,12 +2905,7 @@ If WORKSPACE is not provided current workspace will be used."
 
 (defun lsp--make-message (params)
   "Create a LSP message from PARAMS, after encoding it to a JSON string."
-  (let ((body (lsp--json-serialize params)))
-    (concat "Content-Length: "
-            (number-to-string (1+ (string-bytes body)))
-            "\r\n\r\n"
-            body
-            "\n")))
+  params)
 
 (cl-defstruct lsp--log-entry timestamp process-time type method id body)
 
@@ -6018,7 +6014,9 @@ textDocument/didOpen for the new file."
       (lsp--flush-delayed-changes)))
 
   (condition-case err
-      (process-send-string proc message)
+      (if (featurep 'emacs-ng)
+          (lsp-emacsng-send-no-wait message)
+        (process-send-string proc message))
     ('error (lsp--error "Sending to process failed with the following error: %s"
                         (error-message-string err)))))
 
@@ -6794,31 +6792,33 @@ returned by COMMAND is available via `executable-find'"
                                                (seq-every-p (lambda (el)
                                                               (stringp el))
                                                             l))))))
-  (list :connect (lambda (filter sentinel name environment-fn)
-                   (let ((final-command (lsp-resolve-final-function command))
-                         (process-name (generate-new-buffer-name name))
-                         (process-environment
-                          (lsp--compute-process-environment environment-fn)))
-                     (let* ((stderr-buf (format "*%s::stderr*" process-name))
-                            (proc (make-process
-                                   :name process-name
-                                   :connection-type 'pipe
-                                   :buffer (format "*%s*" process-name)
-                                   :coding 'no-conversion
-                                   :command final-command
-                                   :filter filter
-                                   :sentinel sentinel
-                                   :stderr stderr-buf
-                                   :noquery t)))
-                       (set-process-query-on-exit-flag proc nil)
-                       (set-process-query-on-exit-flag (get-buffer-process stderr-buf) nil)
-                       (with-current-buffer (get-buffer stderr-buf)
-                         ;; Make the *NAME::stderr* buffer buffer-read-only, q to bury, etc.
-                         (special-mode))
-                       (cons proc proc))))
-        :test? (or
-                test-command
-                (lambda () (-> command lsp-resolve-final-function lsp-server-present?)))))
+  (if (featurep 'emacs-ng)
+      (lsp-emacsng-stdio-connection command test-command)
+    (list :connect (lambda (filter sentinel name environment-fn)
+                     (let ((final-command (lsp-resolve-final-function command))
+                           (process-name (generate-new-buffer-name name))
+                           (process-environment
+                            (lsp--compute-process-environment environment-fn)))
+                       (let* ((stderr-buf (format "*%s::stderr*" process-name))
+                              (proc (make-process
+                                     :name process-name
+                                     :connection-type 'pipe
+                                     :buffer (format "*%s*" process-name)
+                                     :coding 'no-conversion
+                                     :command final-command
+                                     :filter filter
+                                     :sentinel sentinel
+                                     :stderr stderr-buf
+                                     :noquery t)))
+                         (set-process-query-on-exit-flag proc nil)
+                         (set-process-query-on-exit-flag (get-buffer-process stderr-buf) nil)
+                         (with-current-buffer (get-buffer stderr-buf)
+                           ;; Make the *NAME::stderr* buffer buffer-read-only, q to bury, etc.
+                           (special-mode))
+                         (cons proc proc))))
+          :test? (or
+                  test-command
+                  (lambda () (-> command lsp-resolve-final-function lsp-server-present?))))))
 
 (defun lsp--open-network-stream (host port name)
   "Open network stream to HOST:PORT.
@@ -7087,6 +7087,7 @@ SESSION is the active session."
     (setf (lsp--workspace-proc workspace) proc
           (lsp--workspace-cmd-proc workspace) cmd-proc)
 
+    (setq lsp-global-workspace workspace)
     ;; update (lsp-session-folder->servers) depending on whether we are starting
     ;; multi/single folder workspace
     (mapc (lambda (project-root)
@@ -7101,7 +7102,7 @@ SESSION is the active session."
       (lsp-request-async
        "initialize"
        (append
-        (list :processId nil
+        (list :processId 33333
               :rootPath (lsp-file-local-name (expand-file-name root))
               :clientInfo (list :name "emacs"
                                 :version (emacs-version))
