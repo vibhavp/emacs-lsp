@@ -45,6 +45,7 @@
   * Add ~lsp-lens-place-position~ with option to place code lens at end of line as default.
   * Add LanguageTool support.
   * Add Beancount support.
+  * Add interactive ~lsp-rust-analyzer-move-item-up~ and ~lsp-rust-analyzer-move-item-down~ functions to move Rust items / statements
 ** Release 7.0.1
   * Introduced ~lsp-diagnostics-mode~.
   * Safe renamed ~lsp-flycheck-default-level~ -> ~lsp-diagnostics-flycheck-default-level~
